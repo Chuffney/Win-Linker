@@ -94,11 +94,12 @@ struct SymbolTableEntry //18 bytes
     union
     {
         uint8_t ShortName[8];
-        struct
+        struct  //LongName
         {
             uint32_t Zeroes;
             uint32_t Offset;
         };
+        uint64_t singleChunk;
     };
     uint32_t Value;
     uint16_t SectionNumber;

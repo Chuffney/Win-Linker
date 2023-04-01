@@ -2,7 +2,7 @@
 ;uses the C Standard Library
 ;MS calling convention
 
-%include common.inc
+%include "common.inc"
 
 extern malloc
 extern realloc

@@ -2,17 +2,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "List/list.h"
+#include "List/NSlist.h"
 #include "help.h"
 #include "pe.h"
 
 static List exportedSymbols;
 static List nullTerminatedStrings;
 
+#pragma pack(push, 1)
 struct terminatedSymbol //if a COFF symbol is exactly 8 bytes long it isn't null terminated and needs to be copied to a temporary buffer
 {
-    uint8_t string[8];
+    union
+    {
+        uint8_t string[8];
+        uint64_t singleChunk;
+    };
     uint8_t nullTerminator;
 };
+#pragma pack(pop)
 
 static inline void printHelp()
 {
@@ -22,6 +29,7 @@ static inline void printHelp()
 static inline void initStaticMem()
 {
     initList(&exportedSymbols, sizeof(char*));
+    NS_initList(&nullTerminatedStrings, sizeof(struct terminatedSymbol));
 }
 
 static inline void collectExported(const char* objectFile)
@@ -45,7 +53,14 @@ static inline void collectExported(const char* objectFile)
             add(&exportedSymbols, (size_t) stringTable + tableOffset);
         } else
         {
-            add(&exportedSymbols, (size_t) symbol->ShortName);
+            if (symbol->ShortName[7] == 0)
+                add(&exportedSymbols, (size_t) symbol->ShortName);
+            else
+            {
+                struct terminatedSymbol string = {.singleChunk = symbol->singleChunk, .nullTerminator = 0};
+                struct terminatedSymbol* stringPtr = NS_addRef(&nullTerminatedStrings, &string);
+                add(&exportedSymbols, (size_t) stringPtr);
+            }
         }
     }
 }
@@ -74,6 +89,7 @@ int main(int argc, char** argv)
     }
     free(memPtr);
     free(exportedSymbols.arrayPtr);
+    free(nullTerminatedStrings.arrayPtr);
 
     return 0;
 }
