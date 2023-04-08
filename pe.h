@@ -10,8 +10,9 @@
 
 #define FILE_OFFSET 0x3c    //where PE_SIGNATURE is located
 #define PE_SIGNATURE "PE\0\0"
-#define SYMBOL_FUNCTION 0x20
 
+
+#pragma pack(push, 1)
 struct COFF_header
 {
     /**
@@ -49,7 +50,10 @@ struct Section_header
     /**
      * An 8-byte, null-padded UTF-8 encoded string. If the string is exactly 8 characters long, there is no terminating null. For longer names, this field contains a slash (/) that is followed by an ASCII representation of a decimal number that is an offset into the string table. Executable images do not use a string table and do not support section names longer than 8 characters. Long names in object files are truncated if they are emitted to an executable file.
      */
-    uint64_t Name;
+     union {
+         int8_t ShortName[8];
+         uint64_t singleChunk;
+     } Name;
     /**
      * The total size of the section when loaded into memory. If this value is greater than SizeOfRawData, the section is zero-padded. This field is valid only for executable images and should be set to zero for object files.
      */
@@ -88,7 +92,6 @@ struct Section_header
     uint32_t Characteristics;
 };
 
-#pragma pack(push, 1)
 struct SymbolTableEntry //18 bytes
 {
     union
@@ -110,9 +113,18 @@ struct SymbolTableEntry //18 bytes
 #pragma pack(pop)
 
 
-//Characteristics
+//Characteristics (section flags)
+#define IMAGE_SCN_CNT_CODE 0x20
+#define IMAGE_SCN_CNT_INITIALIZED_DATA 0x40
+#define IMAGE_SCN_CNT_UNINITIALIZED_DATA 0x80
+
 #define IMAGE_SCN_MEM_EXECUTE 0x20000000
 #define IMAGE_SCN_MEM_READ 0x40000000
 #define IMAGE_SCN_MEM_WRITE 0x80000000
+
+
+//Symbol parameters
+#define SYMBOL_FUNCTION 0x20
+#define EXTERNAL_SYMBOL 0x2
 
 #endif

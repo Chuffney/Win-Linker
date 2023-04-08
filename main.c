@@ -3,14 +3,14 @@
 #include <stdlib.h>
 #include "List/list.h"
 #include "List/NSlist.h"
-#include "help.h"
 #include "pe.h"
 
-static List exportedSymbols;
 static List nullTerminatedStrings;
+static List linkedFiles;
+static List finalSections;
 
 #pragma pack(push, 1)
-struct terminatedSymbol //if a COFF symbol is exactly 8 bytes long it isn't null terminated and needs to be copied to a temporary buffer
+struct terminatedString //if a COFF symbol is exactly 8 bytes long it isn't null terminated and needs to be copied to a temporary buffer
 {
     union
     {
@@ -19,55 +19,35 @@ struct terminatedSymbol //if a COFF symbol is exactly 8 bytes long it isn't null
     };
     uint8_t nullTerminator;
 };
+
+struct staticImportEntry
+{
+    uint32_t textOffset;
+    uint32_t symbolIndex;
+    uint16_t unknown;   //always value 4 todo: figure out if this is important
+};
 #pragma pack(pop)
 
-static inline void printHelp()
+struct objectFile
 {
-    printf("%s", helpMessage);
-}
+    char* fileName;
+    char* contents;
+    List* exportedSymbols;
+    List* exportedSymbolsOffsets;
+    List* importedSymbols;
+    List* sections;
+};
 
-static inline void initStaticMem()
+struct section
 {
-    initList(&exportedSymbols, sizeof(char*));
-    NS_initList(&nullTerminatedStrings, sizeof(struct terminatedSymbol));
-}
+    char* name;
+    uint32_t flags;
+    uint32_t sizeOfRawData;
+};
 
-static inline void collectExported(const char* objectFile)
+char* loadFile(const char* fileName)
 {
-    struct COFF_header* header = (struct COFF_header*) objectFile;
-    uint32_t symbolCount = header->NumberOfSymbols;
-    struct SymbolTableEntry* symbolTable = (struct SymbolTableEntry*) (objectFile + header->PointerToSymbolTable);
-
-    uint8_t* stringTable = (uint8_t*) symbolTable + (symbolCount * sizeof(struct SymbolTableEntry));
-
-    for (uint32_t i = 0; i < symbolCount; i++)
-    {
-        struct SymbolTableEntry* symbol = &symbolTable[i];
-
-        if (symbol->Type != SYMBOL_FUNCTION)
-            continue;
-
-        if (symbol->Zeroes == 0)
-        {
-            uint32_t tableOffset = symbol->Offset;
-            add(&exportedSymbols, (size_t) stringTable + tableOffset);
-        } else
-        {
-            if (symbol->ShortName[7] == 0)
-                add(&exportedSymbols, (size_t) symbol->ShortName);
-            else
-            {
-                struct terminatedSymbol string = {.singleChunk = symbol->singleChunk, .nullTerminator = 0};
-                struct terminatedSymbol* stringPtr = NS_addRef(&nullTerminatedStrings, &string);
-                add(&exportedSymbols, (size_t) stringPtr);
-            }
-        }
-    }
-}
-
-static char* loadFile(const char* filename)
-{
-    FILE* file = fopen(filename, "rb");
+    FILE* file = fopen(fileName, "rb");
     fseek(file, 0, SEEK_END);
     size_t length = ftell(file);
     fseek(file, 0, SEEK_SET);
@@ -77,20 +57,145 @@ static char* loadFile(const char* filename)
     return buffer;
 }
 
+void processFiles(int argc, char** argv)
+{
+    uint32_t numberOfFiles = argc - 1;
+    char** fileNames = &argv[1];
+    for (uint32_t i = 0; i < numberOfFiles; i++)
+    {
+        struct objectFile newFile = {
+                .fileName = fileNames[i],
+                .contents = loadFile(fileNames[i]),
+                .exportedSymbols = newList(sizeof(char*)),
+                .exportedSymbolsOffsets = newList(sizeof(uint32_t)),
+                .importedSymbols = newList(sizeof(char*)),
+                .sections = newList(sizeof(struct section*))
+        };
+        NS_addRef(&linkedFiles, &newFile);
+    }
+}
+
+static void initStaticMem()
+{
+    NS_initList(&nullTerminatedStrings, sizeof(struct terminatedString));
+    NS_initList(&linkedFiles, sizeof(struct objectFile));
+    NS_initList(&finalSections, sizeof(struct section));
+}
+
+static char* addTerminatedString(uint64_t string)
+{
+    struct terminatedString terminatedString = {.singleChunk = string, .nullTerminator = 0};
+    return NS_addRef(&nullTerminatedStrings, &terminatedString);
+}
+
+static uint32_t asciiToBin(const char* asciiNumber, int length)
+{
+    uint32_t sum = 0;
+    uint32_t powerOfTen = 1;
+    for (int i = length - 1; i >= 0; i--)
+    {
+        sum += (asciiNumber[i] - '0') * powerOfTen;
+        powerOfTen *= 10;
+    }
+    return sum;
+}
+
+void collectSymbols(struct objectFile* file)
+{
+    struct COFF_header* COFF_header = (struct COFF_header*) file->contents;
+    uint32_t symbolCount = COFF_header->NumberOfSymbols;
+    struct SymbolTableEntry* symbolTable = (struct SymbolTableEntry*) ((size_t) COFF_header + COFF_header->PointerToSymbolTable);
+    uint8_t* stringTable = (uint8_t*) symbolTable + (symbolCount * sizeof(struct SymbolTableEntry));
+
+    List* exportList = file->exportedSymbols;
+    List* importList = file->importedSymbols;
+
+    for (uint32_t i = 0; i < symbolCount; i++)
+    {
+        struct SymbolTableEntry* symbol = &symbolTable[i];
+        List* listPtr;
+
+        if (symbol->Type != SYMBOL_FUNCTION)
+            continue;
+
+        if (symbol->StorageClass == EXTERNAL_SYMBOL)
+            listPtr = importList;
+        else
+            listPtr = exportList;
+
+        if (symbol->Zeroes == 0)
+        {
+            uint32_t stringTableOffset = symbol->Offset;
+            add(listPtr, (size_t) stringTable + stringTableOffset);
+        } else
+        {
+            if (symbol->ShortName[7] == 0)
+                add(listPtr, (size_t) symbol->ShortName);
+            else
+            {
+                char* stringPtr = addTerminatedString(symbol->singleChunk);
+                add(listPtr, (size_t) stringPtr);
+            }
+        }
+    }
+
+    struct Section_header* sectionTable = (struct Section_header*) (file->contents + COFF_header->SizeOfOptionalHeader + sizeof(struct COFF_header));
+    uint16_t sectionCount = COFF_header->NumberOfSections;
+
+    for (uint16_t i = 0; i < sectionCount; i++)
+    {
+        struct Section_header* sectionTableEntry = &sectionTable[i];
+        struct section newSection;
+
+        if (sectionTableEntry->Name.ShortName[0] != '/')    //short name
+        {
+            if (sectionTableEntry->Name.ShortName[7] == 0)  //needs no terminating
+                newSection.name = (char*) &sectionTableEntry->Name;
+            else
+                newSection.name = addTerminatedString(sectionTableEntry->Name.singleChunk);
+        } else  //long name in string table
+        {
+            uint32_t stringTableOffset = asciiToBin(&sectionTableEntry->Name.ShortName[1], 7);
+            newSection.name = stringTable + stringTableOffset;
+        }
+        newSection.flags = sectionTableEntry->Characteristics;
+        newSection.sizeOfRawData = sectionTableEntry->SizeOfRawData;
+        add(file->sections, (size_t) &newSection);
+    }
+}
+
+void collectSections(struct objectFile* file)
+{
+    struct COFF_header* COFF_header = (struct COFF_header*) file->contents;
+    struct Section_header* sectionTable = (struct Section_header*) (file->contents + COFF_header->SizeOfOptionalHeader + sizeof(struct COFF_header));
+    uint16_t sectionCount = COFF_header->NumberOfSections;
+
+    uint32_t symbolCount = COFF_header->NumberOfSymbols;
+    struct SymbolTableEntry* symbolTable = (struct SymbolTableEntry*) ((size_t) COFF_header + COFF_header->PointerToSymbolTable);
+    uint8_t* stringTable = (uint8_t*) symbolTable + (symbolCount * sizeof(struct SymbolTableEntry));
+
+    for (uint16_t i = 0; i < sectionCount; i++)
+    {
+        struct Section_header* sectionTableEntry = &sectionTable[i];
+        struct section newSection = {
+                .name = (char*) &sectionTableEntry->Name
+        };
+    }
+}
+
 int main(int argc, char** argv)
 {
     initStaticMem();
-    char* memPtr = loadFile("main.o");
-    collectExported(memPtr);
-    for (int i = 0; i < exportedSymbols.currentLength; i++)
+    processFiles(argc, argv);
+    for (int i = 0; i < linkedFiles.currentLength; i++)
     {
-        printf("%s", ((char**) exportedSymbols.arrayPtr)[i]);
-        putchar(0xA);
+        struct objectFile file = ((struct objectFile*) linkedFiles.arrayPtr)[i];
+        collectSymbols(&file);
+        collectSections(&file);
     }
-    free(memPtr);
-    free(exportedSymbols.arrayPtr);
-    free(nullTerminatedStrings.arrayPtr);
 
+    free(nullTerminatedStrings.arrayPtr);
+    free(linkedFiles.arrayPtr);
     return 0;
 }
 
