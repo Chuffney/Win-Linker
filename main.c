@@ -1,53 +1,40 @@
-#include <string.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include "List/list.h"
-#include "List/NSlist.h"
-#include "pe.h"
+#include <stdio.h>
+#include <string.h>
+#include <resizeableBuffer.h>
+#include <pe.h>
+#include <stdbool.h>
+#include <globals.h>
+#include <emission.h>
 
-static List nullTerminatedStrings;
-static List linkedFiles;
-static List finalSections;
+stringBuffer mainStringBuffer;
+binaryBuffer symbolBuffer;
+binaryBuffer sectionBuffer;
+binaryBuffer relocationBuffer;
 
-#pragma pack(push, 1)
-struct terminatedString //if a COFF symbol is exactly 8 bytes long it isn't null terminated and needs to be copied to a temporary buffer
+void error(const char* message, const char* extra)
 {
-    union
-    {
-        uint8_t string[8];
-        uint64_t singleChunk;
-    };
-    uint8_t nullTerminator;
-};
+    fprintf(stderr, "%s ", message);
+    fprintf(stderr, "%s\n", extra);
 
-struct staticImportEntry
+    exit(1);
+}
+
+static void initBuffers(void)
 {
-    uint32_t textOffset;
-    uint32_t symbolIndex;
-    uint16_t unknown;   //always value 4 todo: figure out if this is important
-};
-#pragma pack(pop)
+    initBufferObject(&mainStringBuffer);
+    initBufferObject(&symbolBuffer);
+    initBufferObject(&sectionBuffer);
+    initBufferObject(&relocationBuffer);
+}
 
-struct objectFile
-{
-    char* fileName;
-    char* contents;
-    List* exportedSymbols;
-    List* exportedSymbolsOffsets;
-    List* importedSymbols;
-    List* sections;
-};
-
-struct section
-{
-    char* name;
-    uint32_t flags;
-    uint32_t sizeOfRawData;
-};
-
-char* loadFile(const char* fileName)
+static char* loadFile(const char* fileName)
 {
     FILE* file = fopen(fileName, "rb");
+
+    if (file == NULL)
+        error("file not found", fileName);
+
     fseek(file, 0, SEEK_END);
     size_t length = ftell(file);
     fseek(file, 0, SEEK_SET);
@@ -57,154 +44,175 @@ char* loadFile(const char* fileName)
     return buffer;
 }
 
-void processFiles(int argc, char** argv)
+
+static char* resolveSymbolName(const struct COFF_symbol* symbol, const char* COFF_stringTable)
 {
-    uint32_t numberOfFiles = argc - 1;
-    char** fileNames = &argv[1];
-    for (uint32_t i = 0; i < numberOfFiles; i++)
+    uint32_t stringOffset;
+    if (symbol->Name.Zeroes == 0)   //long name
     {
-        struct objectFile newFile = {
-                .fileName = fileNames[i],
-                .contents = loadFile(fileNames[i]),
-                .exportedSymbols = newList(sizeof(char*)),
-                .exportedSymbolsOffsets = newList(sizeof(uint32_t)),
-                .importedSymbols = newList(sizeof(char*)),
-                .sections = newList(sizeof(struct section*))
+        stringOffset = addString(&mainStringBuffer, COFF_stringTable + symbol->Name.Offset);
+    } else  //short name
+    {
+        struct nullTerminatedString
+        {
+            uint64_t chars;
+            uint8_t terminator;
         };
-        NS_addRef(&linkedFiles, &newFile);
+
+        struct nullTerminatedString temporaryString = {
+                .chars = symbol->Name.ShortName,
+                .terminator = 0
+        };
+        stringOffset = addString(&mainStringBuffer, (char*) &temporaryString);
     }
+    return mainStringBuffer.bufferPtr + stringOffset;
 }
 
-static void initStaticMem()
+static uint64_t truncatedSectionName(const struct Section_header* section, const char* COFF_stringTable)
 {
-    NS_initList(&nullTerminatedStrings, sizeof(struct terminatedString));
-    NS_initList(&linkedFiles, sizeof(struct objectFile));
-    NS_initList(&finalSections, sizeof(struct section));
-}
-
-static char* addTerminatedString(uint64_t string)
-{
-    struct terminatedString terminatedString = {.singleChunk = string, .nullTerminator = 0};
-    return NS_addRef(&nullTerminatedStrings, &terminatedString);
-}
-
-static uint32_t asciiToBin(const char* asciiNumber, int length)
-{
-    uint32_t sum = 0;
-    uint32_t powerOfTen = 1;
-    for (int i = length - 1; i >= 0; i--)
+    struct nullTerminatedString
     {
-        sum += (asciiNumber[i] - '0') * powerOfTen;
-        powerOfTen *= 10;
-    }
-    return sum;
+        uint64_t chars;
+        uint8_t terminator;
+    };
+
+    struct nullTerminatedString temporaryString = {
+            .chars = section->Name,
+            .terminator = 0
+    };
+
+    if ((char) section->Name == '/') //long name - ascii decimal offset into string table
+    {
+        uint32_t stringTableOffset = atoi((char*) &temporaryString + 1);
+        temporaryString.chars = 0;
+        strcpy_s((char*) &temporaryString, 8, COFF_stringTable + stringTableOffset);
+        return temporaryString.chars;
+    } else
+        return section->Name; //short name
 }
 
-void collectSymbols(struct objectFile* file)
+static ResolvedSection* checkExistingSections(struct Section_header* section, const char* COFF_stringTable)
 {
-    struct COFF_header* COFF_header = (struct COFF_header*) file->contents;
-    uint32_t symbolCount = COFF_header->NumberOfSymbols;
-    struct SymbolTableEntry* symbolTable = (struct SymbolTableEntry*) ((size_t) COFF_header + COFF_header->PointerToSymbolTable);
-    uint8_t* stringTable = (uint8_t*) symbolTable + (symbolCount * sizeof(struct SymbolTableEntry));
-
-    List* exportList = file->exportedSymbols;
-    List* importList = file->importedSymbols;
-
-    for (uint32_t i = 0; i < symbolCount; i++)
+    ResolvedSection* sectionArray = sectionBuffer.bufferPtr;
+    uint64_t truncatedName = truncatedSectionName(section, COFF_stringTable);
+    for (uint32_t bufferIterator = 0; bufferIterator < sectionBuffer.currentOffset / sizeof(ResolvedSection); bufferIterator++)
     {
-        struct SymbolTableEntry* symbol = &symbolTable[i];
-        List* listPtr;
-
-        if (symbol->Type != SYMBOL_FUNCTION)
-            continue;
-
-        if (symbol->StorageClass == EXTERNAL_SYMBOL)
-            listPtr = importList;
-        else
-            listPtr = exportList;
-
-        if (symbol->Zeroes == 0)
+        if (truncatedName == sectionArray[bufferIterator].name)
         {
-            uint32_t stringTableOffset = symbol->Offset;
-            add(listPtr, (size_t) stringTable + stringTableOffset);
-        } else
-        {
-            if (symbol->ShortName[7] == 0)
-                add(listPtr, (size_t) symbol->ShortName);
-            else
+            if (section->Characteristics != sectionArray[bufferIterator].characteristics)
             {
-                char* stringPtr = addTerminatedString(symbol->singleChunk);
-                add(listPtr, (size_t) stringPtr);
+                error("redefined section privileges:", (void*) truncatedName);
+            }
+            return &sectionArray[bufferIterator];
+        }
+    }
+
+    ResolvedSection newSection = {
+            .name = truncatedName,
+            .characteristics = section->Characteristics,
+    };
+    initBufferObject(&newSection.buffer);
+
+    return sectionBuffer.bufferPtr + addChunk(&sectionBuffer, &newSection, sizeof(ResolvedSection));
+}
+
+/**
+ * @param symbol the new symbol to be added
+ * @return <b>true</b> if there is a collision
+ */
+static bool checkSymbolsForCollisions(const char* name)
+{
+    ResolvedSymbol* symbolArray = symbolBuffer.bufferPtr;
+    for (uint32_t i = 0; i < symbolBuffer.currentOffset / sizeof(ResolvedSymbol); i++)
+    {
+        if (strcmp(name, symbolArray[i].name) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static void processObjectFile(const char* filePath)
+{
+    void* file = loadFile(filePath);
+    struct COFF_header* coff = file;
+    struct COFF_symbol* symbolTable = file + coff->PointerToSymbolTable;
+    char* stringTable = (char*) (symbolTable + coff->NumberOfSymbols);
+
+    const uint16_t numberOfSections = coff->NumberOfSections;
+    struct Section_header* sections = file + sizeof(struct COFF_header);
+
+
+    for (uint16_t sectionIterator = 0; sectionIterator < numberOfSections; sectionIterator++)
+    {
+        struct Section_header* currentSection = &sections[sectionIterator];
+        void* rawData = (void*) coff + currentSection->PointerToRawData;
+        ResolvedSection* currentResolvedSection = checkExistingSections(currentSection, stringTable);
+        uint16_t resolvedSectionIndex = ((void*) currentResolvedSection - sectionBuffer.bufferPtr) / sizeof(ResolvedSection);
+        binaryBuffer* buffer = &currentResolvedSection->buffer;
+        uint32_t sectionRelocationBase = addChunk(buffer, rawData, currentSection->SizeOfRawData);
+
+        for (uint32_t symbolIterator = 0; symbolIterator < coff->NumberOfSymbols; symbolIterator++)
+        {
+            struct COFF_symbol symbol = symbolTable[symbolIterator];
+            symbolIterator += symbol.NumberOfAuxSymbols;
+
+            if (symbol.StorageClass != 2)
+                continue;
+
+            if (symbol.SectionNumber == sectionIterator + 1)    //section table is one-indexed
+            {
+                char* symbolName = resolveSymbolName(&symbol, stringTable);
+                if (checkSymbolsForCollisions(symbolName))
+                {
+                    error("redefined symbol:", symbolName);
+                }
+                ResolvedSymbol resSymbol = {
+                        .name = symbolName,
+                        .address = sectionRelocationBase + symbol.Value,
+                        .section = resolvedSectionIndex
+                };
+                addChunk(&symbolBuffer, &resSymbol, sizeof(ResolvedSymbol));
+                //printf("%s, %s, %s\n", filePath, &currentResolvedSection->name, resSymbol.name);
             }
         }
-    }
 
-    struct Section_header* sectionTable = (struct Section_header*) (file->contents + COFF_header->SizeOfOptionalHeader + sizeof(struct COFF_header));
-    uint16_t sectionCount = COFF_header->NumberOfSections;
+        struct COFF_relocation* relocations = file + currentSection->PointerToRelocations;
 
-    for (uint16_t i = 0; i < sectionCount; i++)
-    {
-        struct Section_header* sectionTableEntry = &sectionTable[i];
-        struct section newSection;
-
-        if (sectionTableEntry->Name.ShortName[0] != '/')    //short name
+        for (uint16_t relocationIterator = 0; relocationIterator < currentSection->NumberOfRelocations; relocationIterator++)
         {
-            if (sectionTableEntry->Name.ShortName[7] == 0)  //needs no terminating
-                newSection.name = (char*) &sectionTableEntry->Name;
-            else
-                newSection.name = addTerminatedString(sectionTableEntry->Name.singleChunk);
-        } else  //long name in string table
-        {
-            uint32_t stringTableOffset = asciiToBin(&sectionTableEntry->Name.ShortName[1], 7);
-            newSection.name = stringTable + stringTableOffset;
+            struct COFF_relocation relocation = relocations[relocationIterator];
+            struct COFF_symbol* relocatedSymbol = &symbolTable[relocation.SymbolTableIndex];
+
+            if ((relocatedSymbol->Value == 0 && relocatedSymbol->StorageClass == IMAGE_SYM_CLASS_STATIC) ||
+                relocatedSymbol->StorageClass == IMAGE_SYM_CLASS_SECTION)
+                continue;
+
+            Relocation internalRelocation = {
+                    .name = resolveSymbolName(relocatedSymbol, stringTable),
+                    .address = relocation.VirtualAddress,
+                    .section = resolvedSectionIndex,
+                    .type = relocation.Type
+            };
+            addChunk(&relocationBuffer, &internalRelocation, sizeof(Relocation));
+            //printf("%s %d\n", internalRelocation.name, internalRelocation.address);
         }
-        newSection.flags = sectionTableEntry->Characteristics;
-        newSection.sizeOfRawData = sectionTableEntry->SizeOfRawData;
-        add(file->sections, (size_t) &newSection);
     }
 }
 
-void collectSections(struct objectFile* file)
+static void relocateSymbols(void)
 {
-    struct COFF_header* COFF_header = (struct COFF_header*) file->contents;
-    struct Section_header* sectionTable = (struct Section_header*) (file->contents + COFF_header->SizeOfOptionalHeader + sizeof(struct COFF_header));
-    uint16_t sectionCount = COFF_header->NumberOfSections;
-
-    uint32_t symbolCount = COFF_header->NumberOfSymbols;
-    struct SymbolTableEntry* symbolTable = (struct SymbolTableEntry*) ((size_t) COFF_header + COFF_header->PointerToSymbolTable);
-    uint8_t* stringTable = (uint8_t*) symbolTable + (symbolCount * sizeof(struct SymbolTableEntry));
-
-    for (uint16_t i = 0; i < sectionCount; i++)
+    for (uint16_t iterator = 0; iterator < (uint16_t) (relocationBuffer.currentOffset / sizeof(Relocation)); iterator++)
     {
-        struct Section_header* sectionTableEntry = &sectionTable[i];
-        struct section newSection = {
-                .name = (char*) &sectionTableEntry->Name
-        };
+
     }
 }
 
-int main(int argc, char** argv)
+int main()
 {
-    initStaticMem();
-    processFiles(argc, argv);
-    for (int i = 0; i < linkedFiles.currentLength; i++)
-    {
-        struct objectFile file = ((struct objectFile*) linkedFiles.arrayPtr)[i];
-        collectSymbols(&file);
-        collectSections(&file);
-    }
-
-    free(nullTerminatedStrings.arrayPtr);
-    free(linkedFiles.arrayPtr);
+    initBuffers();
+    //processObjectFile("resizeableBuffer.obj");
+    processObjectFile("inp.o");
+    emitExecutable("out.bin");
     return 0;
 }
-
-/* plan:
- *
- * collect exported symbols
- * collect and compare imported symbols
- * count and collect number of all sections
- * merge all comparable sections into their final forms (.text, .bss, .data, .rdata)
- * as this is being done - resolve new addresses to symbols
- * wrap the data in headers
- */
